@@ -1,0 +1,257 @@
+import time
+import runloop
+import motor
+import motor_pair
+from hub import port, motion_sensor
+
+# ===== Definição dos motores =====
+LEFT = port.A
+RIGHT = port.B
+M_UP_L_PORT = port.F
+M_UP_R_PORT = port.E
+
+# Motores superiores
+M_UP_L = M_UP_L_PORT
+M_UP_R = M_UP_R_PORT
+
+# Pares de motores
+FRONT_PAIR = motor_pair.pair(motor_pair.PAIR_1, LEFT, RIGHT)
+UP_PAIR = motor_pair.pair(motor_pair.PAIR_2, M_UP_L_PORT, M_UP_R_PORT)
+
+MAX_SPEED = 900
+
+
+
+
+        
+
+#vai garantir que um valor nunca va passar do minimo nem do maximo
+def clamp(x, lo, hi):
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+    
+#le o angulo em graus
+def yaw_deg():
+    try:
+        return motion_sensor.get_yaw_face()
+    except:
+        return motion_sensor.tilt_angles()[0]/10
+
+# classe do pid ne paizao
+class PID:
+    def __init__(self, kp, ki, kd, out_min=-300, out_max=300, i_min=-2000, i_max=2000):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_min, self.out_max = out_min, out_max
+        self.i_min, self.i_max = i_min, i_max
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_t = time.ticks_ms()
+
+        #reseta os valores das variaveis
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_t = time.ticks_ms()
+
+        #calcula o tempo passado desde o ultimo erro
+    def step(self, error):
+        now = time.ticks_ms()
+        dt_ms = time.ticks_diff(now, self.prev_t)
+        if dt_ms <= 0:
+            dt_ms = 1
+        self.prev_t = now
+
+        dt_s = dt_ms / 1000.0
+
+        #sistema anti-windup
+        self.integral += error * dt_s
+        self.integral = clamp(self.integral, self.i_min, self.i_max)
+
+        derivative = (error - self.prev_error) / dt_s
+        self.prev_error = error
+
+        out = self.kp*error + self.ki*self.integral + self.kd*derivative
+        return clamp(out, self.out_min, self.out_max)
+
+# ===== ANDAR RETO com pidzinho =====
+async def move_pid(seconds, base_speed=500, kp=3.5, ki=0.02, kd=12.0,
+                accel_time=0.5, decel_time=0.5):
+
+    # seta e reseta o angulo atual de volta para zero
+    try:
+        motion_sensor.set_yaw_face(0)
+    except:
+        pass
+    motion_sensor.reset_yaw(0)
+    motor.reset_relative_position(LEFT, 0)
+    motor.reset_relative_position(RIGHT, 0)
+
+    pid = PID(kp, ki, kd, out_min=-400, out_max=400)
+    start = time.ticks_ms()
+    total_time = seconds * 1000
+
+    while time.ticks_diff(time.ticks_ms(), start) < total_time:
+        elapsed = time.ticks_diff(time.ticks_ms(), start)
+
+        # calcula rampa de aceleração/desaceleração
+        if elapsed < accel_time * 1000:
+            speed_factor = elapsed / (accel_time * 1000)
+        elif elapsed > total_time - decel_time * 1000:
+            speed_factor = (total_time - elapsed) / (decel_time * 1000)
+        else:
+            speed_factor = 1.0
+        speed_factor = max(0.0, min(1.0, speed_factor))
+
+        # cálculo do erro/ângulo
+        error = -yaw_deg()
+        angle = motion_sensor.tilt_angles()[2]
+        correction = pid.step(error)
+
+        left_v = int(clamp((base_speed - correction) * speed_factor, -MAX_SPEED, MAX_SPEED))
+        #CM eu te amo😘❤
+        right_v = int(clamp((base_speed + correction) * speed_factor, -MAX_SPEED, MAX_SPEED))
+
+        motor.run(LEFT, left_v)
+        motor.run(RIGHT, right_v)
+        # printa os valores
+        print(error)
+        print(angle)
+
+        await runloop.sleep_ms(10)
+
+    motor.stop(LEFT)
+    motor.stop(RIGHT)
+
+    
+
+  
+
+
+
+# ===== GIRAR com guinadinha =====
+async def turn_pid(target_deg, max_speed=400, kp=3.5, ki=0.02, kd=12.0,
+                accel_time=0.5):
+    
+    #seta e reseta a guinada e o angulo do robo
+    try:
+        motion_sensor.set_yaw_face(0)
+    except:
+        pass
+    motion_sensor.reset_yaw(0)
+
+    pid = PID(kp, ki, kd, out_min=-max_speed, out_max=max_speed)
+    self_start = time.ticks_ms()
+
+    while True:
+        # cálculo do erro/ângulo 
+        error = target_deg - yaw_deg()
+        angle = motion_sensor.tilt_angles()[2]
+        correction = pid.step(error)
+
+        elapsed = time.ticks_diff(time.ticks_ms(), self_start)
+        if elapsed < accel_time * 1000:
+            speed_factor = elapsed / (accel_time * 1000)
+        else:
+            speed_factor = 1.0
+
+        left_v = int(clamp(correction * speed_factor, -max_speed, max_speed))
+        right_v = -left_v
+
+        motor.run(LEFT, left_v)
+        motor.run(RIGHT, right_v)
+
+        # condição de parada
+        if abs(error) < 2 and abs(correction) < 5:
+            break
+
+            # printa os valores no console
+        print(error)
+        print(angle)
+
+        await runloop.sleep_ms(10)
+
+    motor.stop(LEFT)
+    motor.stop(RIGHT)
+
+  #classe de movimentos basicos sem o uso de pid(mover, girar sem pid) e tmb movimnetos como parabulas movimentos para anexos
+class Moviment:
+    def __init__(self, front_pair, up_pair, motor_up_l, motor_up_r):
+       
+        # Inicializa a classe Moviment com os pares de motores frontais e superiores,
+        # e os motores individuais superiores esquerdo e direito.
+        
+        self.front_pair = front_pair    # Par de motores da frente (esquerda e direita)
+        self.up_pair = up_pair            # Par de motores superiores (levantamento)
+        self.motor_up_l = motor_up_l    # Motor superior esquerdo (porta)
+        self.motor_up_r = motor_up_r    # Motor superior direito (porta)
+
+    async def front(self, time_s, speed=500):
+       
+        # Move o robô para frente por um tempo definido.
+       
+        self.front_pair.move_tank_for_time(speed, speed, time_s)
+        await runloop.sleep_ms(10)# Pequeno atraso para garantir execução estável
+        self.front_pair.stop()
+
+    async def turn(self, degrees, speed=400):
+      
+        # Faz o robô girar 
+        
+       
+        self.front_pair.start_tank(speed, -speed)# Um motor vai pra frente e o outro pra trás
+        await runloop.sleep_ms(int(abs(degrees) * 4))# Tempo de rotação baseado no grau
+        self.front_pair.stop()
+
+    async def parable(self, time_s, degrees, speed=450):
+     
+        # Executa um movimento composto:
+        # Primeiro anda para frente, depois gira uma certa quantidade de graus.
+        # Ideal para movimentos em curva ou trajetórias anguladas.
+     
+        await self.front(time_s, speed)
+        await self.turn(degrees, speed)
+
+    async def _run_motor_temporarily(self, port, time_s, speed):
+       
+       # Função auxiliar interna.
+        # Roda um motor individual  por um tempo e para.
+     
+    
+        motor.run_for_time(port, int(time_s * 1000), speed)
+        await runloop.sleep_ms(10)# Pequeno atraso para evitar sobrecarga de execução
+        motor.stop(port)
+
+    async def up_l(self, time_s, speed=450):
+        
+        # Aciona o motor superior esquerdo 
+        
+        await self._run_motor_temporarily(self.motor_up_l, time_s, speed)
+
+    async def up_r(self, time_s, speed=450):
+       
+        # Aciona o motor superior direito.
+     
+        await self._run_motor_temporarily(self.motor_up_r, time_s, speed)
+
+    async def up_both(self, time_s, speed=460):
+      
+        # Aciona os dois motores superiores ao mesmo tempo
+      
+        self.up_pair.move_tank_for_time(speed, speed, time_s)
+        await runloop.sleep_ms(10)
+        self.up_pair.stop(
+  
+
+async def main():
+
+    robot = Moviment(FRONT_PAIR, UP_PAIR, M_UP_L, M_UP_R)
+
+    await move_pid(1)
+    await turn_pid(90)
+    await robot.turn(90)
+    await robot.parable(1,-20)
+    
+    
+
+runloop.run(main())
