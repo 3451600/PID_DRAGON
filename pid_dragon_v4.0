@@ -1,0 +1,176 @@
+import time
+import runloop
+import motor
+import motor_pair
+from hub import port, motion_sensor
+
+# ===== AJUSTE/definição dos motores =====
+LEFT = port.A
+RIGHT = port.B
+M_UP_L = port.F
+M_UP_R = port.E
+front_par = motor_pair.pair(motor_pair.PAIR_1, LEFT, RIGHT)
+up_par = motor_pair.pair(motor_pair.PAIR_2, M_UP_L, M_UP_R)
+MAX_SPEED = 900# °/s seguro para motores grandes
+# =====================================
+
+
+
+
+        
+
+#vai garantir que um valor nunca va passar do minimo nem do maximo
+def clamp(x, lo, hi):
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+    
+#le o angulo em graus
+def yaw_deg():
+    try:
+        return motion_sensor.get_yaw_face()
+    except:
+        return motion_sensor.tilt_angles()[0]/10
+
+# classe do pid ne paizao
+class PID:
+    def __init__(self, kp, ki, kd, out_min=-300, out_max=300, i_min=-2000, i_max=2000):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_min, self.out_max = out_min, out_max
+        self.i_min, self.i_max = i_min, i_max
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_t = time.ticks_ms()
+
+        #reseta os valores das variaveis
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_t = time.ticks_ms()
+
+        #calcula o tempo passado desde o ultimo erro
+    def step(self, error):
+        now = time.ticks_ms()
+        dt_ms = time.ticks_diff(now, self.prev_t)
+        if dt_ms <= 0:
+            dt_ms = 1
+        self.prev_t = now
+
+        dt_s = dt_ms / 1000.0
+
+        #sistema anti-windup
+        self.integral += error * dt_s
+        self.integral = clamp(self.integral, self.i_min, self.i_max)
+
+        derivative = (error - self.prev_error) / dt_s
+        self.prev_error = error
+
+        out = self.kp*error + self.ki*self.integral + self.kd*derivative
+        return clamp(out, self.out_min, self.out_max)
+
+# ===== ANDAR RETO com pidzinho=====
+async def move_pid(seconds, base_speed=500, kp=3.5, ki=0.02, kd=12.0):
+
+    #seta e reseta o angulo atual de volta para zero
+    try:
+        motion_sensor.set_yaw_face(0)
+    except:
+        pass
+    motion_sensor.reset_yaw(0)
+    motor.reset_relative_position(LEFT, 0)
+    motor.reset_relative_position(RIGHT, 0)
+
+
+    pid = PID(kp, ki, kd, out_min=-400, out_max=400)
+    start = time.ticks_ms()
+
+    while time.ticks_diff(time.ticks_ms(), start) < seconds * 1000:
+        angle = motion_sensor.tilt_angles()[2]
+        error = -yaw_deg()
+        correction = pid.step(error)
+
+        left_v = int(clamp(base_speed - correction, -MAX_SPEED, MAX_SPEED))
+        right_v = int(clamp(base_speed + correction, -MAX_SPEED, MAX_SPEED))
+
+        motor.run(LEFT, left_v)
+        motor.run(RIGHT, right_v)
+
+        await runloop.sleep_ms(10)
+
+       #printa os valores para o console
+        print(error)
+        print(angle)
+
+    motor.stop(LEFT)
+    motor.stop(RIGHT)
+
+
+
+
+# ===== GIRO PRECISO utilizando guinada =====
+async def turn_pid(target_deg, max_speed=300, kp=3.0, ki=0.02, kd=10.0):
+    #reseta a guinada para zero
+    try:
+        motion_sensor.set_yaw_face(0)
+    except:
+        pass
+    motion_sensor.reset_yaw(0)
+
+    #caLCULA O ERRO
+    pid = PID(kp, ki, kd, out_min=-max_speed, out_max=max_speed)
+    settled_ms = 0
+    while True:
+        angle = motion_sensor.tilt_angles()[2]
+        error = target_deg - yaw_deg()
+        correction = pid.step(error)
+
+        #velocidade da correção do erro
+        left_v = int(clamp(correction, -max_speed, max_speed))
+        right_v = -left_v
+
+        #executa essa correção
+        motor.run(LEFT, left_v)
+        motor.run(RIGHT, right_v)
+
+        if abs(error) < 1.0:
+            settled_ms += 10
+        else:
+            settled_ms = 0
+        if settled_ms >= 200:
+            break
+
+        await runloop.sleep_ms(10)
+
+        #printa os valores utilizados no console
+        print(angle)
+        print(error)
+
+
+
+    motor.stop(LEFT)
+    motor.stop(RIGHT)
+
+
+class moviment:
+    def __init__(self, velocit, time, M_UP_L, M_UP_R , front_par, up_par, BASE_SPEEAD):
+        self.velocit, self.time = velocit, time
+        self.M_UP_L, self.M_UP_R, self.front_par, self.up_par = M_UP_L, M_UP_R, front_par, up_par
+        self.BASE_SPEEAD = BASE_SPEEAD
+
+    async def move_front(self, time, BASE_SPEEAD = 500):
+        await motor_pair.move_tank_for_time(motor_pair.PAIR_1, BASE_SPEEAD, BASE_SPEEAD, time)
+        motor_pair.stop(motor_pair.PAIR_1)
+
+    async def MOVE_UP_L(self, time, BASE_SPEEAD = 450):
+            motor.run_for_time(M_UP_L, time, BASE_SPEEAD)
+
+    async def MOVE_UP_R(self, time, BASE_SPEEAD = 450):
+            motor.run_for_time(M_UP_R, time, BASE_SPEEAD)
+
+    async def MOVE_UP_PAR(self, time, BASE_SPEEAD = 460):
+        motor_pair.move_tank_for_time(motor_pair.PAIR_2, BASE_SPEEAD, BASE_SPEEAD, time)
+
+
+async def main():
+
+runloop.run(main())
