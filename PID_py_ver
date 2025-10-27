@@ -1,239 +1,368 @@
-
 import time
-import runloop
-import motor
-import motor_pair
-import math
-from hub import port, motion_sensor, button, light_matrix
+import math,runloop
+from spike import PrimeHub, Motor# type: ignore
+from hub import port                # port.A, port.B
 
-LEFT = port.A
-RIGHT = port.B
+# portas
+LEFT_PORT = port.A
+RIGHT_PORT = port.B
 
+# globals (devem ser instanciados em main)
+hub = None
+left_motor = None
+right_motor = None
 
-def now_ms():
-
-    if hasattr(time, "ticks_ms") and callable(getattr(time, "ticks_ms")):
-        return time.ticks_ms()
-    return int(time.time() * 1000)
-
-def clamp(x, lo, hi):
-    if x is None:
-        return 0
-    return max(lo, min(hi, x))
-
-def read_encoder_port_simple(p):
+# ---------- Awaitable bool helper ----------
+class AwaitableBool:
     """
-    Tenta ler posição do motor via API 'motor' mais simples.
-    Ajuste se seu firmware tem getter diferente.
+    Objeto que:
+    - se usado em contexto booleano (if ...), avalia como bool(self.value)
+    - se awaitado (await obj), retorna self.value
+    - expõe .value para acesso direto se necessário
     """
+    __slots__ = ("value",)
 
-    fn = getattr(motor, "get_position", None)
-    if callable(fn):
-        val = fn(p)
-        if isinstance(val, (list, tuple)):
-            val = val[0]
-        return float(val)
-   
-    fn = getattr(motor, "position", None)
-    if callable(fn):
-        val = fn(p)
-        if isinstance(val, (list, tuple)):
-            val = val[0]
-        return float(val)
+    def __init__(self, value):
+        self.value = bool(value)
 
-    raise AttributeError("Nenhum getter de posição (get_position/position) disponível no módulo 'motor'")
+    def __bool__(self):
+        return bool(self.value)
 
+    # torna o objeto awaitable: `await obj` funciona e retorna o booleano.
+    def __await__(self):
+        # generator that immediately returns value
+        if False:
+            yield None
+        return self.value
 
-def read_yaw():
-    """
-    Tenta obter yaw/heading do motion_sensor de forma defensiva.
-    Retorna float (graus) ou None se não houver leitura disponível.
-    Tenta vários nomes comuns de método/atributo.
-    """
-    ms = motion_sensor
+    def __repr__(self):
+        return "AwaitableBool({})".format(self.value)
+
+def wrap_bool(v):
+    return AwaitableBool(bool(v))
+
+# ----- utilitários -----
+def clamp(v, lo, hi):
+    if v is None:
+        return lo
+    return max(lo, min(hi, v))
+
+def normalize_angle(a):
+    return (a + 180) % 360 - 180
+
+def now_s():
+    return time.time()
+
+def safe_stop(m):
+    try:
+        if m is None:
+            return
+        if hasattr(m, "stop") and callable(m.stop):
+            m.stop()
+        elif hasattr(m, "run") and callable(m.run):
+            m.run(0)
+    except Exception:
+        pass
+
+def apply_motor_cmd(m, speed):
+    if m is None:
+        raise RuntimeError("Motor não inicializado")
+    if hasattr(m, "start") and callable(m.start):
+        m.start(int(speed))
+    elif hasattr(m, "run") and callable(m.run):
+        m.run(int(speed))
+    else:
+        raise RuntimeError("API do motor não encontrada (esperado start/run)")
+
+# ----- leituras defensivas -----
+def read_motor_position(m):
+    if m is None:
+        raise AttributeError("Motor object is None")
+    for name in ("get_position", "get_degrees", "position"):
+        member = getattr(m, name, None)
+        if callable(member):
+            val = member()
+            if isinstance(val, (list, tuple)):
+                val = val[0]
+            return float(val)
+        if member is not None and isinstance(member, (int, float)):
+            return float(member)
+    raise AttributeError("Nenhum getter de posição conhecido (get_position/get_degrees/position)")
+
+def read_yaw(h):
+    if h is None:
+        return None
+    ms = getattr(h, "motion_sensor", None)
     if ms is None:
         return None
-
-    
-    candidates = (
-        "get_yaw",        
-        "get_yaw_angle",
-        "get_heading",
-        "get_pose",
-        "get_yaw_face",
-        "yaw",           
-    )
-
-    for name in candidates:
+    for name in ("get_yaw_angle", "get_yaw", "get_heading", "get_pose", "get_yaw_face", "yaw"):
         member = getattr(ms, name, None)
         if callable(member):
             try:
                 v = member()
-                if isinstance(v, (list, tuple)):
-                    v = v[0]
+            except Exception:
+                continue
+            if isinstance(v, (list, tuple)):
+                v = v[0]
+            try:
                 return float(v)
             except Exception:
-                # se chamar falhar, tenta o próximo candidato
                 continue
         else:
-            # se existir como atributo numérico
             if member is not None and isinstance(member, (int, float)):
                 return float(member)
-
-    
     return None
 
+# ----- tentativa defensiva de reset do yaw -----
+def reset_yaw(h):
+    if h is None:
+        return False
+    ms = getattr(h, "motion_sensor", None)
+    if ms is None:
+        return False
 
+    reset_names = ("reset_yaw", "reset_yaw_angle", "reset_heading", "zero_yaw", "zero_heading")
+    for name in reset_names:
+        fn = getattr(ms, name, None)
+        if callable(fn):
+            try:
+                fn()
+                time.sleep(0.05)
+                return True
+            except Exception:
+                continue
 
-class PID:
-    def __init__(self, kp, ki, kd, out_min=-300, out_max=300, i_min=-2000, i_max=2000):
-        self.kp = float(kp)
-        self.ki = float(ki)
-        self.kd = float(kd)
-        self.out_min = out_min
-        self.out_max = out_max
-        self.i_min = i_min
-        self.i_max = i_max
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.prev_t = now_ms()
+    set_fn = getattr(ms, "set_yaw", None)
+    if callable(set_fn):
+        try:
+            set_fn(0)
+            time.sleep(0.05)
+            return True
+        except Exception:
+            pass
 
-    def reset(self):
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.prev_t = now_ms()
+    return False
 
-    def step(self, error):
-        now = now_ms()
-        dt_ms = now - self.prev_t
-        if dt_ms <= 0:
-            dt_ms = 1        # mínimo 1 ms para evitar divisão por zero
-        dt = dt_ms / 1000.0
+# ----- ramp simplificada -----
+def ramp_step(current, target, accel_per_s, dt_s):
+    if accel_per_s <= 0 or dt_s <= 0:
+        return target
+    max_delta = accel_per_s * dt_s
+    diff = target - current
+    if abs(diff) <= max_delta:
+        return target
+    return current + (max_delta if diff > 0 else -max_delta)
 
-        self.integral += error * dt
-        self.integral = clamp(self.integral, self.i_min, self.i_max)
+# ----- movimento: heading obrigatório, com reset automático -----
+def move_pid(distance_cm,
+            base_speed=40,
+            wheel_diameter_cm=5.6,
+            kp_sync=0.6,
+            accel=120.0,
+            decel_distance_cm=10.0,
+            min_speed=8.0,
+            timeout_s=10.0,
+            heading_kp=1.2,
+            heading_limit=20.0):
+    """
+    Move distância em cm. Correção por heading é obrigatória.
+    Ao iniciar, tenta resetar o yaw para zero. Se não conseguir, aborta.
+    Usa as variáveis globais left_motor/right_motor/hub (instanciar em main()).
+    Retorna AwaitableBool (comportamento booleano síncrono e awaitable em async).
+    """
+    global hub, left_motor, right_motor
+    lm = left_motor
+    rm = right_motor
+    h = hub
 
-        derivative = (error - self.prev_error) / dt
+    if lm is None or rm is None:
+        raise RuntimeError("Motores não inicializados (chame main()).")
+    if h is None:
+        print("ERRO: Hub não instanciado — heading é obrigatório para move_pid.")
+        return wrap_bool(False)
 
-        out = self.kp * error + self.ki * self.integral + self.kd * derivative
-        out = clamp(out, self.out_min, self.out_max)
+    # reset do yaw no início (obrigatório)
+    ok_reset = reset_yaw(h)
+    if not ok_reset:
+        print("ERRO: não foi possível resetar yaw (motion_sensor). move_pid exige reset de yaw.")
+        return wrap_bool(False)
 
-        self.prev_error = error
-        self.prev_t = now
-        return out
+    # encontra yaw inicial (deveria ser ~0 após reset)
+    initial_yaw = read_yaw(h)
+    if initial_yaw is None:
+        print("ERRO: motion_sensor yaw não disponível após reset — abortando.")
+        return wrap_bool(False)
 
+    wheel_circ = math.pi * wheel_diameter_cm
+    target_deg = (distance_cm / wheel_circ) * 360.0
+    direction = 1 if target_deg >= 0 else -1
 
-def move_pid(distance_cm, base_speed=40, wheel_diameter_cm=5.6, kp=0.6, timeout_s=8.0):
-    # cálculo simples de graus alvo
-    wheel_circ = math.pi * float(wheel_diameter_cm)
-    rotations_needed = float(distance_cm) / wheel_circ
-    target_degrees = rotations_needed * 360.0
-
-    direction = 1 if target_degrees >= 0 else -1
-    base_speed_signed = int(direction * abs(base_speed))
-
-    
+    # leitura inicial dos encoders (se falhar, aborta)
     try:
-        left_start = read_encoder_port_simple(LEFT)
-        right_start = read_encoder_port_simple(RIGHT)
-        
-        if not isinstance(left_start, (int, float)) or not isinstance(right_start, (int, float)):
-            raise TypeError("Leituras iniciais dos encoders não são numéricas")
-        use_encoders = True
+        left_start = read_motor_position(lm)
+        right_start = read_motor_position(rm)
     except Exception as e:
-        # fallback por tempo: encoders não disponíveis ou getter diferente
-        print("AVISO: encoders não disponíveis no início (usar fallback por tempo). Erro:", e)
-        use_encoders = False
-        left_start = right_start = 0.0
+        print("ERRO: leitura inicial dos encoders falhou — move_pid requer encoders funcionais. (", e, ")")
+        return wrap_bool(False)
 
-    start_ms = now_ms()
-    est_speed_cm_s = 20.0 * (abs(base_speed) / 100.0)
-    if est_speed_cm_s <= 0:
-        est_speed_cm_s = 5.0
+    cur_l_speed = 0.0
+    cur_r_speed = 0.0
+    last_t = now_s()
+    start_t = now_s()
+
+    deg_per_cm = 360.0 / wheel_circ
+    decel_deg_trigger = decel_distance_cm * deg_per_cm
 
     try:
         while True:
-            elapsed_s = (now_ms() - start_ms) / 1000.0
-            if elapsed_s > timeout_s:
-                motor.run(LEFT, 0)
-                motor.run(RIGHT, 0)
-                return False
+            t = now_s()
+            dt = t - last_t
+            if dt <= 0:
+                dt = 1e-3
+            last_t = t
 
-            if use_encoders:
-                try:
-                    cur_left = read_encoder_port_simple(LEFT)
-                    cur_right = read_encoder_port_simple(RIGHT)
-                    if not isinstance(cur_left, (int, float)) or not isinstance(cur_right, (int, float)):
-                        raise TypeError("Leitura de encoder retornou tipo inválido")
-                    left_pos = float(cur_left) - float(left_start)
-                    right_pos = float(cur_right) - float(right_start)
-                except Exception as e:
-                    print("AVISO: leitura de encoders falhou durante o movimento, fazendo fallback por tempo. Erro:", e)
-                    use_encoders = False
-                    start_ms = now_ms()
-                    motor.run(LEFT, 0); motor.run(RIGHT, 0)
-                    continue
+            # timeout
+            if t - start_t > timeout_s:
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
 
-                moved = (abs(left_pos) + abs(right_pos)) / 2.0
-                if abs(moved) >= abs(target_degrees):
-                    motor.run(LEFT, 0); motor.run(RIGHT, 0)
-                    return True
+            # leitura encoders (se falhar durante o trajeto, aborta)
+            try:
+                cur_left = read_motor_position(lm) - left_start
+                cur_right = read_motor_position(rm) - right_start
+            except Exception as e:
+                print("ERRO: leitura de encoder falhou durante o movimento — abortando. (", e, ")")
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
 
-                err = left_pos - right_pos
-                correction = kp * err
+            moved_deg = (abs(cur_left) + abs(cur_right)) / 2.0
+            remaining = max(0.0, abs(target_deg) - moved_deg)
+            if remaining <= 0:
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(True)
 
-                left_speed = clamp(base_speed_signed - correction, -100, 100)
-                right_speed = clamp(base_speed_signed + correction, -100, 100)
-                motor.run(LEFT, int(left_speed))
-                motor.run(RIGHT, int(right_speed))
+            # velocidade base com desaceleração proporcional
+            if remaining <= decel_deg_trigger:
+                scale = remaining / decel_deg_trigger
+                base = clamp(abs(base_speed) * scale, min_speed, abs(base_speed)) * (1 if direction > 0 else -1)
             else:
-                moved_cm = est_speed_cm_s * elapsed_s
-                if abs(moved_cm) >= abs(distance_cm):
-                    motor.run(LEFT, 0); motor.run(RIGHT, 0)
-                    return True
-                motor.run(LEFT, base_speed_signed)
-                motor.run(RIGHT, base_speed_signed)
+                base = base_speed * (1 if direction > 0 else -1)
 
-            runloop.sleep_ms(30)
+            # sincronização entre rodas (P)
+            err_sync = cur_left - cur_right
+            corr_sync = kp_sync * err_sync
+
+            # correção de heading (P obrigatória)
+            cur_yaw = read_yaw(h)
+            if cur_yaw is None:
+                print("ERRO: leitura de yaw falhou durante o movimento — abortando.")
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
+            yaw_err = normalize_angle(cur_yaw - initial_yaw)
+            heading_corr = clamp(heading_kp * yaw_err, -abs(heading_limit), abs(heading_limit))
+
+            # combina correções
+            desired_l = clamp(base - corr_sync - heading_corr, -100, 100)
+            desired_r = clamp(base + corr_sync + heading_corr, -100, 100)
+
+            # aplica rampa simples
+            cur_l_speed = ramp_step(cur_l_speed, desired_l, accel, dt)
+            cur_r_speed = ramp_step(cur_r_speed, desired_r, accel, dt)
+
+            # envia comandos
+            try:
+                apply_motor_cmd(lm, cur_l_speed)
+                apply_motor_cmd(rm, cur_r_speed)
+            except Exception as e:
+                print("ERRO ao enviar comando aos motores:", e)
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
+
+            time.sleep(0.03)
     finally:
-        motor.run(LEFT, 0); motor.run(RIGHT, 0)
+        safe_stop(lm); safe_stop(rm)
 
+# ----- turn PID simplificado (PD) com reset automático de yaw -----
+def turn_pid(target_deg, base_speed=30, kp=1.0, kd=0.03, tol=2.0, timeout_s=6.0):
+    """
+    Gira até target_deg usando PD. Antes de girar, reseta o yaw para zero.
+    Retorna AwaitableBool.
+    """
+    global hub, left_motor, right_motor
+    lm = left_motor
+    rm = right_motor
+    h = hub
 
-def turn_pid(target_deg, base_speed=20, kp=1.0, ki=0.0, kd=0.0, tolerance_deg=1.0, timeout_s=6.0):
-    pid = PID(kp, ki, kd, out_min=-100, out_max=100)
-    pid.reset()
-    t_start = now_ms()
-    def normalize_angle(a):
-        return (a + 180) % 360 - 180
+    if lm is None or rm is None:
+        raise RuntimeError("Motores não inicializados (chame main()).")
+    if h is None:
+        print("ERRO: Hub não inicializado; turn_pid requer motion_sensor.")
+        return wrap_bool(False)
+
+    # reset do yaw antes do giro (obrigatório)
+    ok_reset = reset_yaw(h)
+    if not ok_reset:
+        print("ERRO: não foi possível resetar yaw (motion_sensor). turn_pid abortando.")
+        return wrap_bool(False)
+
+    # quick check pós-reset
+    yaw0 = read_yaw(h)
+    if yaw0 is None:
+        print("ERRO: motion_sensor yaw não disponível após reset; abortando.")
+        return wrap_bool(False)
+
+    t0 = now_s()
+    prev_t = now_s()
+    prev_err = 0.0
     target = normalize_angle(target_deg)
 
-    while True:
-        if (now_ms() - t_start) / 1000.0 > timeout_s:
-            motor.run(LEFT, 0); motor.run(RIGHT, 0)
-            return False
+    try:
+        while True:
+            t = now_s()
+            if t - t0 > timeout_s:
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
 
-        yaw = read_yaw()
-        if yaw is None:
-            # se não temos sensor de yaw disponível, abortamos com aviso (comportamento original)
-            print("AVISO: motion_sensor yaw não disponível; turn_pid não pode controlar ângulo com precisão.")
-            motor.run(LEFT, 0); motor.run(RIGHT, 0)
-            return False
+            yaw = read_yaw(h)
+            if yaw is None:
+                print("ERRO: leitura de yaw falhou durante o giro.")
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
 
-        error = normalize_angle(target - float(yaw))
+            err = normalize_angle(target - float(yaw))
+            if abs(err) <= tol:
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(True)
 
-        if abs(error) <= tolerance_deg:
-            motor.run(LEFT, 0); motor.run(RIGHT, 0)
-            return True
+            dt = t - prev_t
+            if dt <= 0:
+                dt = 1e-3
 
-        correction = pid.step(error)
-        left_speed = clamp(base_speed - correction, -100, 100)
-        right_speed = clamp(-base_speed - correction, -100, 100)
-        motor.run(LEFT, int(left_speed))
-        motor.run(RIGHT, int(right_speed))
-        runloop.sleep_ms(20)
+            p = kp * err
+            d = kd * ((err - prev_err) / dt)
+            out = clamp(p + d, -abs(base_speed), abs(base_speed))
+
+            lcmd = int(clamp(out, -100, 100))
+            rcmd = int(clamp(-out, -100, 100))
+
+            try:
+                apply_motor_cmd(lm, lcmd)
+                apply_motor_cmd(rm, rcmd)
+            except Exception as e:
+                print("ERRO ao enviar comando de giro:", e)
+                safe_stop(lm); safe_stop(rm)
+                return wrap_bool(False)
+
+            prev_err = err
+            prev_t = t
+            time.sleep(0.02)
+    finally:
+        safe_stop(lm); safe_stop(rm)
+
 
 async def main():
     # write your code here
-    await light_matrix.write("Hi!")
+    await move_pid(20)
+    await turn_pid(90)
 
 runloop.run(main())
